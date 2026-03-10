@@ -1,6 +1,6 @@
 /**
  * Project routes
- * POST /api/project/render — Render user page and write to R2 (replaces Worker /admin/render-page)
+ * POST /api/project/render — Render user page and write to R2
  * GET  /api/project/:subdomain — Get project config from KV
  */
 const express = require('express');
@@ -9,6 +9,7 @@ const { r2Put, r2Get } = require('../utils/r2');
 const { kvGet, kvPut } = require('../utils/kv');
 const { injectData } = require('../utils/html');
 const { purgeCacheUrls } = require('../utils/cache');
+const { supabase } = require('../utils/supabase'); // Added Supabase Client
 
 const router = express.Router();
 
@@ -25,80 +26,140 @@ async function addToUserIndex(templateName, subdomain) {
     }
 }
 
+// ── Helper: Supabase Validation & Quota Checking ─────────────────────────────
+async function validateAndCheckQuota(userId, subdomain) {
+    if (!userId) {
+        return { isValid: false, code: 4001, message: '请求必须包含 userId 以验证身份' };
+    }
+
+    // 1. Check if subdomain already exists
+    const { data: existingProject, error: fetchErr } = await supabase
+        .from('projects')
+        .select('user_id')
+        .eq('subdomain', subdomain)
+        .maybeSingle();
+
+    if (fetchErr) {
+        throw new Error('Supabase Error: ' + fetchErr.message);
+    }
+
+    if (existingProject) {
+        // Domain is taken. Check ownership.
+        if (existingProject.user_id !== userId) {
+            return { isValid: false, code: 4010, message: '该域名前缀已被他人抢先使用，请更换试试哦' };
+        }
+        // It's their domain = Update Scenario (A-2 / A-3)
+        return { isValid: true, mode: 'UPDATE' };
+    } else {
+        // Domain is not taken = Create Scenario (A-1)
+        // Feature: 1 Free Domain Limit Check
+        const { count, error: countErr } = await supabase
+            .from('projects')
+            .select('subdomain', { count: 'exact', head: true })
+            .eq('user_id', userId);
+
+        if (countErr) throw new Error('Supabase Count Error: ' + countErr.message);
+
+        const MAX_FREE_DOMAINS = 1; // Later can query a 'users' table to check if VIP
+        if (count >= MAX_FREE_DOMAINS) {
+            return { isValid: false, code: 4030, message: '免费域名额度已用尽，请开通 VIP 获取更多配额' };
+        }
+
+        return { isValid: true, mode: 'CREATE' };
+    }
+}
+
 // ── POST /api/project/render ───────────────────────────────────────────────
-// Public endpoint: no admin key required.
-// Abuse protection (Cloudflare Turnstile) to be added in P2.
+// Universal CQRS write endpoint (Handles Create & Update)
 router.post('/render', async (req, res) => {
     try {
-        const { subdomain, type, data = {} } = req.body ?? {};
+        const { userId, subdomain, type, data = {} } = req.body ?? {};
 
+        // 1. Payload validation
         if (!subdomain || !type) {
-            return res.status(400).json({ error: '`subdomain` and `type` are required' });
+            return res.status(400).json({ code: 4001, message: "参数校验失败: 'subdomain' 与 'type' 为必选项", data: null });
         }
         if (!/^[a-z0-9-]+$/.test(subdomain)) {
-            return res
-                .status(400)
-                .json({ error: '`subdomain` must be lowercase alphanumeric and hyphens only' });
+            return res.status(400).json({ code: 4002, message: "参数校验失败: 'subdomain' 只能包含小写字母和数字", data: null });
         }
 
-        // 1. Load template metadata from KV
+        // 2. Ownership & Quota checks via Supabase
+        const authCheck = await validateAndCheckQuota(userId, subdomain);
+        if (!authCheck.isValid) {
+            return res.status(400).json({ code: authCheck.code, message: authCheck.message, data: null });
+        }
+        const isUpdate = (authCheck.mode === 'UPDATE');
+
+        // 3. Load template metadata from target R2 directory/KV
         const meta = await kvGet(`__tmpl__${type}`);
         if (!meta) {
-            return res.status(404).json({ error: `Template '${type}' not found in KV` });
+            return res.status(404).json({ code: 4040, message: `模板 ${type} 不存在或未发布`, data: null });
         }
 
-        // 2. Fetch template HTML + schema from R2
+        // 4. Fetch Template base files from R2
         const [htmlBuf, schemaBuf] = await Promise.all([
             r2Get(`templates/${type}/${meta.version}/index.html`),
             r2Get(`templates/${type}/${meta.version}/schema.json`),
         ]);
+
         if (!htmlBuf) {
-            return res
-                .status(404)
-                .json({ error: `Template HTML not found in R2 for type='${type}' version='${meta.version}'` });
+            return res.status(404).json({ code: 4041, message: '核心模板源文件缺失', data: null });
         }
 
         const schema = schemaBuf ? JSON.parse(schemaBuf.toString('utf-8')) : null;
 
-        // 3. Render HTML with user data
+        // 5. Render HTML with user data
         const rendered = injectData(htmlBuf.toString('utf-8'), data, schema);
 
-        // 4. Check if this is an update (project already existed)
-        const isUpdate = !!(await kvGet(subdomain));
-
-        // 5. Overwrite R2 page (zero-garbage strategy — always same key)
+        // 6. Push final static HTML to R2
         await r2Put(`pages/${subdomain}.html`, Buffer.from(rendered, 'utf-8'), 'text/html;charset=UTF-8');
 
-        // 6. Persist user config in KV
-        await kvPut(subdomain, { type, data });
+        // 7. Push lightweight router config to KV (Edge router uses status:1 to allow traffic)
+        await kvPut(subdomain, { status: 1, template: type });
 
-        // 7. Register user in template's user index
+        // 8. Register user in legacy template's user index 
         await addToUserIndex(type, subdomain);
 
-        // 8. Purge CDN cache if this is an update
+        // 9. Persist the transaction into Supabase PostgreSQL
+        // We use upsert allowing overriding config if it's the same subdomain
+        const { error: upsertErr } = await supabase
+            .from('projects')
+            .upsert({
+                subdomain,
+                user_id: userId,
+                template_type: type,
+                data: data,
+                updated_at: new Date().toISOString()
+            }, { onConflict: 'subdomain' });
+
+        if (upsertErr) {
+            console.error('[Supabase Upsert Error]:', upsertErr);
+            // Although DB failed, R2/KV succeeded. Log error but don't crash user.
+        }
+
+        // 10. Purge CDN cache if this is an update
+        const pageUrl = `https://${subdomain}.${BASE_DOMAIN}/`;
         if (isUpdate) {
-            const pageUrl = `https://${subdomain}.${BASE_DOMAIN}/`;
             await purgeCacheUrls([pageUrl]);
         }
 
-        const pageUrl = `https://${subdomain}.${BASE_DOMAIN}/`;
-        const previewUrl = `${pageUrl}?preview=${Date.now()}`;
-
-        return res.json({
-            success: true,
-            subdomain,
-            type,
-            url: pageUrl,
-            previewUrl,
-            isUpdate,
+        // 11. Return standard successful response
+        return res.status(200).json({
+            code: 0,
+            message: "网页生成成功",
+            data: {
+                url: pageUrl
+            }
         });
+
     } catch (err) {
-        console.error('[project/render]', err);
-        return res.status(500).json({ error: err.message });
+        console.error('[project/render Fatal Error]', err);
+        return res.status(500).json({ code: 5000, message: '服务器内部渲染错误', error: err.message, data: null });
     }
 });
 
 // ── GET /api/project/:subdomain ────────────────────────────────────────────
+// Internal Admin route
 router.get('/:subdomain', requireAdmin, async (req, res) => {
     try {
         const { subdomain } = req.params;
