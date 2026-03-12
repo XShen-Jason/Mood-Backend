@@ -108,6 +108,83 @@ router.post('/upload', requireAdmin, upload.any(), async (req, res) => {
     }
 });
 
+// ── POST /api/template/sync-local ─────────────────────────────────────────────
+// Admin only: Scans the local filesystem and pushes all templates to R2/KV.
+router.post('/sync-local', requireAdmin, async (req, res) => {
+    try {
+        const templatesRoot = path.join(__dirname, '../../../RomanceSpace-Templates/src');
+        if (!fs.existsSync(templatesRoot)) {
+            return res.status(404).json({ error: `Templates source directory not found at ${templatesRoot}` });
+        }
+
+        const dirs = fs.readdirSync(templatesRoot, { withFileTypes: true })
+            .filter(d => d.isDirectory())
+            .map(d => d.name);
+
+        const results = [];
+        for (const name of dirs) {
+            const dirPath = path.join(templatesRoot, name);
+            const indexHtml = path.join(dirPath, 'index.html');
+            if (!fs.existsSync(indexHtml)) continue;
+
+            const version = makeVersion();
+            
+            // Collect files in this template
+            const files = [];
+            const walk = (d, rel = '') => {
+                const entries = fs.readdirSync(d, { withFileTypes: true });
+                for (const e of entries) {
+                    const r = rel ? `${rel}/${e.name}` : e.name;
+                    const p = path.join(d, e.name);
+                    if (e.isDirectory()) walk(p, r);
+                    else files.push({ rel: r, path: p });
+                }
+            };
+            walk(dirPath);
+
+            // Upload to R2
+            for (const f of files) {
+                const content = fs.readFileSync(f.path);
+                const r2Key = `templates/${name}/${version}/${f.rel}`;
+                const { getMime } = require('../utils/mime');
+                await r2Put(r2Key, content, getMime(f.rel));
+            }
+
+            // Parse Meta
+            let fields = [];
+            let isStatic = true;
+            const metaPath = [path.join(dirPath, 'config.json'), path.join(dirPath, 'schema.json')]
+                .find(p => fs.existsSync(p));
+            
+            if (metaPath) {
+                const schema = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+                fields = schema.fields ?? [];
+                isStatic = schema.static === true || fields.length === 0;
+            }
+
+            // Update KV
+            await kvPut(`__tmpl__${name}`, {
+                name,
+                version,
+                fields,
+                static: isStatic,
+                updatedAt: new Date().toISOString(),
+            });
+
+            results.push({ name, version, files: files.length });
+        }
+
+        // Invalidate cache
+        cachedTemplates = null;
+        await rebuildStaticTemplateList();
+
+        return res.json({ success: true, count: results.length, details: results });
+    } catch (err) {
+        console.error('[template/sync-local]', err);
+        return res.status(500).json({ error: err.message });
+    }
+});
+
 // ── GET /api/template/list ────────────────────────────────────────────────────
 router.get('/list', async (_req, res) => {
     try {
