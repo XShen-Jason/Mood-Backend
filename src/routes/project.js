@@ -342,8 +342,9 @@ router.get('/status/:userId', async (req, res) => {
         if (profileErr) throw new Error('Supabase Profile Error: ' + profileErr.message);
         
         // Priority: tier field -> role field (as fallback) -> free
-        let tier = profile?.tier || (profile?.role === 'admin' ? 'admin' : 'free');
-        if (tier && !memoryQuotas[tier]) tier = 'free'; // Fallback if invalid tier string
+        const dbTier = (profile?.tier || '').toLowerCase();
+        let tier = dbTier || (profile?.role === 'admin' ? 'admin' : 'free');
+        if (tier && !memoryQuotas[tier]) tier = 'free'; 
         
         console.log(`[Debug Quota] User: ${userId}, Raw Tier: "${profile?.tier}", Role: "${profile?.role}", Final Tier: "${tier}"`);
 
@@ -358,9 +359,9 @@ router.get('/status/:userId', async (req, res) => {
         // 3. Get quota limits
         await ensureQuotas();
         const tierConfig = memoryQuotas[tier] || memoryQuotas['free'];
-        const maxDomains = tierConfig?.limit || 1;
-        const maxDailyEdits = tierConfig?.dailyLimit || 5;
-        const label = tierConfig?.label || '未知等级';
+        const maxDomains = tierConfig?.limit ?? 1;
+        const maxDailyEdits = tierConfig?.dailyLimit ?? 5;
+        const label = tierConfig?.label ?? '体验用户';
         
         const today = new Date().toISOString().split('T')[0];
         const dailyUsedEdits = profile?.last_edit_date === today ? (profile?.daily_edit_count || 0) : 0;
