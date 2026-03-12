@@ -66,14 +66,7 @@ router.post('/upload', requireAdmin, upload.any(), async (req, res) => {
 
         // TODO (P2): async re-render old user pages that use this template
         // For now we log it; BullMQ / worker job to be added later
-        const userIndex = await kvGet(`__users__${templateName}`);
-        const usersCount = Array.isArray(userIndex) ? userIndex.length : 0;
-        if (usersCount > 0) {
-            console.log(
-                `[template/upload] ${usersCount} existing user(s) use '${templateName}'. ` +
-                `Batch re-render NOT YET IMPLEMENTED — add job queue in P2.`
-            );
-        }
+        // (Legacy KV index removed - future implementation should query Supabase)
 
         return res.json({
             success: true,
@@ -83,7 +76,6 @@ router.post('/upload', requireAdmin, upload.any(), async (req, res) => {
             static: isStatic,
             filesUploaded: uploadedFiles,
             previewUrl: `https://www.885201314.xyz/preview/${templateName}`,
-            pendingReRenderUsers: usersCount,
         });
     } catch (err) {
         console.error('[template/upload]', err);
@@ -129,8 +121,39 @@ router.get('/raw/:name', async (req, res) => {
 });
 
 // ── GET /api/template/preview/:name ──────────────────────────────────────────
-router.get('/preview/:name', (req, res) => {
-    return res.redirect(`https://www.885201314.xyz/preview/${req.params.name}`);
+router.get('/preview/:name', async (req, res) => {
+    try {
+        const { name } = req.params;
+        const meta = await kvGet(`__tmpl__${name}`);
+        if (!meta) return res.status(404).send('Template not found');
+
+        const [htmlBuf, schemaBuf] = await Promise.all([
+            r2Get(`templates/${name}/${meta.version}/index.html`),
+            r2Get(`templates/${name}/${meta.version}/schema.json`),
+        ]);
+
+        if (!htmlBuf) return res.status(404).send('Template HTML missing');
+
+        let html = htmlBuf.toString('utf-8');
+        let schema = null;
+        if (schemaBuf) {
+            try { schema = JSON.parse(schemaBuf.toString('utf-8')); } catch (e) { /* ignore */ }
+        }
+
+        // 1. Inject <base> tag so relative assets (CSS/JS) load from the versions path in CDN
+        // Note: Deployment guide suggests assets are served from /assets/:name/ which maps to R2
+        const baseTag = `<base href="https://www.885201314.xyz/assets/${name}/" />`;
+        html = html.replace('<head>', `<head>\n  ${baseTag}`);
+
+        // 2. Inject default data from schema
+        const rendered = injectData(html, {}, schema);
+
+        res.set('Content-Type', 'text/html; charset=utf-8');
+        return res.send(rendered);
+    } catch (err) {
+        console.error('[template/preview]', err);
+        return res.status(500).send('Internal Server Error');
+    }
 });
 
 module.exports = router;

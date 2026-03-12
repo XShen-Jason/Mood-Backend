@@ -32,17 +32,6 @@ async function ensureBlocklist() {
     }
 }
 
-// ── Helper: append projectId to template user index in KV ──────────────────
-async function addToUserIndex(templateName, subdomain) {
-    const key = `__users__${templateName}`;
-    const existing = (await kvGet(key)) ?? [];
-    const list = Array.isArray(existing) ? existing : [];
-    if (!list.includes(subdomain)) {
-        list.push(subdomain);
-        await kvPut(key, list);
-    }
-}
-
 // ── Helper: Supabase Validation & Quota Checking ─────────────────────────────
 async function validateAndCheckQuota(userId, subdomain) {
     if (!userId) {
@@ -155,10 +144,16 @@ router.post('/render', async (req, res) => {
         await r2Put(`pages/${subdomain}/index.html`, Buffer.from(rendered, 'utf-8'), 'text/html;charset=UTF-8');
 
         // 7. Push lightweight router config to KV (Edge router uses status:1 to allow traffic)
-        await kvPut(subdomain, { status: 1, template: type });
+        // Optimization: only write to KV if new or template type changed (Reduce KV Write quota)
+        const oldConfig = isUpdate ? await kvGet(subdomain) : null;
+        if (!oldConfig || oldConfig.template !== type || oldConfig.status !== 1) {
+            await kvPut(subdomain, { status: 1, template: type });
+            console.log(`[project/render] KV Route Updated for ${subdomain} (Type: ${type})`);
+        } else {
+            console.log(`[project/render] KV Route Skip (Unchanged) for ${subdomain}`);
+        }
 
-        // 8. Register user in legacy template's user index 
-        await addToUserIndex(type, subdomain);
+        // 8. (Removed legacy KV user index - now handled by Supabase SQL queries)
 
         // 9. Persist the transaction into Supabase PostgreSQL
         // We use upsert allowing overriding config if it's the same subdomain
