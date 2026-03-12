@@ -68,26 +68,14 @@ router.post('/upload', requireAdmin, upload.any(), async (req, res) => {
             uploadedFiles.push(file.fieldname);
         }
 
-        // Parse schema if present
+        // Parse metadata (config.json or schema.json)
         let fields = [];
-        let fieldsConfig = null;
         let isStatic = true;
-        const schemaFile = files.find((f) => f.fieldname === 'schema.json');
-        if (schemaFile) {
-            try {
-                const schema = JSON.parse(schemaFile.buffer.toString('utf-8'));
-                if (Array.isArray(schema.fields)) {
-                    // Old string array format "fields": ["title", "sender"]
-                    fields = schema.fields.map((f) => f.key ?? f);
-                } else if (typeof schema.fields === 'object' && schema.fields !== null) {
-                    // New object format "fields": { "title": { "label": "...", "default": "..." } }
-                    fieldsConfig = schema.fields;
-                    fields = Object.keys(schema.fields);
-                }
-                isStatic = schema.static === true || fields.length === 0;
-            } catch (e) {
-                console.error('Invalid schema.json', e);
-            }
+        const metaFile = files.find((f) => f.fieldname === 'config.json' || f.fieldname === 'schema.json');
+        if (metaFile) {
+            const schema = JSON.parse(metaFile.buffer.toString('utf-8'));
+            fields = schema.fields ?? [];
+            isStatic = schema.static === true || fields.length === 0;
         }
 
         // Register / update template metadata in KV
@@ -95,7 +83,6 @@ router.post('/upload', requireAdmin, upload.any(), async (req, res) => {
             name: templateName,
             version,
             fields,
-            fields_config: fieldsConfig,
             static: isStatic,
             updatedAt: new Date().toISOString(),
         });
@@ -111,7 +98,6 @@ router.post('/upload', requireAdmin, upload.any(), async (req, res) => {
             templateName,
             version,
             fields,
-            fields_config: fieldsConfig,
             static: isStatic,
             filesUploaded: uploadedFiles,
             previewUrl: `https://www.885201314.xyz/preview/${templateName}`,
@@ -166,17 +152,18 @@ router.get('/preview/:name', async (req, res) => {
         const meta = await kvGet(`__tmpl__${name}`);
         if (!meta) return res.status(404).send('Template not found');
 
-        const [htmlBuf, schemaBuf] = await Promise.all([
+        const [htmlBuf, metaBuf] = await Promise.all([
             r2Get(`templates/${name}/${meta.version}/index.html`),
-            r2Get(`templates/${name}/${meta.version}/schema.json`),
+            r2Get(`templates/${name}/${meta.version}/config.json`)
+                .then(b => b || r2Get(`templates/${name}/${meta.version}/schema.json`)),
         ]);
 
         if (!htmlBuf) return res.status(404).send('Template HTML missing');
 
         let html = htmlBuf.toString('utf-8');
         let schema = null;
-        if (schemaBuf) {
-            try { schema = JSON.parse(schemaBuf.toString('utf-8')); } catch (e) { /* ignore */ }
+        if (metaBuf) {
+            try { schema = JSON.parse(metaBuf.toString('utf-8')); } catch (e) { /* ignore */ }
         }
 
         // 1. Inject <base> tag so relative assets (CSS/JS) load from the versions path in CDN

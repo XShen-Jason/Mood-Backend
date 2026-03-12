@@ -126,16 +126,17 @@ router.post('/render', async (req, res) => {
         }
 
         // 4. Fetch Template base files from R2
-        const [htmlBuf, schemaBuf] = await Promise.all([
+        const [htmlBuf, metaBuf] = await Promise.all([
             r2Get(`templates/${type}/${meta.version}/index.html`),
-            r2Get(`templates/${type}/${meta.version}/schema.json`),
+            r2Get(`templates/${type}/${meta.version}/config.json`)
+                .then(b => b || r2Get(`templates/${type}/${meta.version}/schema.json`)),
         ]);
 
         if (!htmlBuf) {
             return res.status(404).json({ code: 4041, message: '核心模板源文件缺失', data: null });
         }
 
-        const schema = schemaBuf ? JSON.parse(schemaBuf.toString('utf-8')) : null;
+        const schema = metaBuf ? JSON.parse(metaBuf.toString('utf-8')) : null;
 
         // 5. Render HTML with user data
         const rendered = injectData(htmlBuf.toString('utf-8'), data, schema);

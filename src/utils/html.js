@@ -25,7 +25,7 @@ function escapeHtml(str) {
 function injectData(html, data, schema) {
   return html.replace(/\{\{(\w+)\}\}/g, (match, key) => {
     const raw = data[key];
-    const field = schema?.fields?.find((f) => f.key === key);
+    const field = schema?.fields?.find((f) => (f.id === key || f.key === key || f === key));
 
     const resolve = (val) => {
       if (Array.isArray(val)) {
@@ -34,7 +34,8 @@ function injectData(html, data, schema) {
         const wrapEnd = field?.wrapEnd ?? '';
         return wrapStart + val.map(escapeHtml).join(join) + wrapEnd;
       }
-      return escapeHtml(String(val ?? ''));
+      const escaped = escapeHtml(String(val ?? ''));
+      return escaped.replace(/\n/g, '<br>');
     };
 
     if (raw === undefined || raw === null) {
