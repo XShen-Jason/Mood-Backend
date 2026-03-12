@@ -43,6 +43,65 @@ async function rebuildStaticTemplateList() {
     }
 }
 
+// ── GitHub Reverse Sync Helper ────────────────────────────────────────────────
+/**
+ * Commits multiple files to the GitHub templates repository.
+ * Each file in the `files` array should have `fieldname` (relative path) and `buffer`.
+ */
+async function commitToGitHub(templateName, files) {
+    const repoOwner = process.env.TEMPLATES_REPO_OWNER;
+    const repoName = process.env.TEMPLATES_REPO_NAME;
+    const token = process.env.GITHUB_TOKEN;
+
+    if (!repoOwner || !repoName || !token) {
+        console.warn('[commitToGitHub] Missing env vars (OWNER/NAME/TOKEN), skipping GitHub commit.');
+        return;
+    }
+
+    const headers = {
+        'Authorization': `token ${token}`,
+        'User-Agent': 'RomanceSpace-Backend',
+        'Accept': 'application/vnd.github.v3+json'
+    };
+
+    console.log(`[github] Syncing template '${templateName}' to GitHub...`);
+
+    for (const file of files) {
+        const filePath = `src/${templateName}/${file.fieldname}`;
+        const apiUrl = `https://api.github.com/repos/${repoOwner}/${repoName}/contents/${filePath}`;
+
+        try {
+            // 1. Get existing file SHA if it exists
+            let sha = null;
+            const getRes = await fetch(apiUrl, { headers });
+            if (getRes.ok) {
+                const data = await (getRes.json());
+                sha = data.sha;
+            }
+
+            // 2. Put file content (Base64 encoded)
+            const putRes = await fetch(apiUrl, {
+                method: 'PUT',
+                headers,
+                body: JSON.stringify({
+                    message: `Admin UI: Updated template '${templateName}' - ${file.fieldname}`,
+                    content: file.buffer.toString('base64'),
+                    sha: sha ?? undefined
+                })
+            });
+
+            if (!putRes.ok) {
+                const errData = await putRes.json();
+                console.error(`[github] Error committing ${file.fieldname}:`, errData.message);
+            } else {
+                console.log(`[github] Successfully committed: ${filePath}`);
+            }
+        } catch (err) {
+            console.error(`[github] Network error committing ${file.fieldname}:`, err.message);
+        }
+    }
+}
+
 // ── POST /api/template/upload ─────────────────────────────────────────────────
 router.post('/upload', requireAdmin, upload.any(), async (req, res) => {
     try {
@@ -93,6 +152,15 @@ router.post('/upload', requireAdmin, upload.any(), async (req, res) => {
             console.error('[template/upload] Failed to rebuild static list:', err);
         });
 
+        // Optional: Reverse Sync to GitHub if requested
+        const syncToGithub = req.body.syncToGithub === 'true';
+        if (syncToGithub) {
+            // Run in background to avoid blocking response
+            commitToGitHub(templateName, files).catch(err => {
+                console.error('[template/upload] GitHub sync failed:', err);
+            });
+        }
+
         return res.json({
             success: true,
             templateName,
@@ -101,6 +169,7 @@ router.post('/upload', requireAdmin, upload.any(), async (req, res) => {
             static: isStatic,
             filesUploaded: uploadedFiles,
             previewUrl: `https://www.885201314.xyz/preview/${templateName}`,
+            githubSynced: syncToGithub
         });
     } catch (err) {
         console.error('[template/upload]', err);
