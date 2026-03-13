@@ -3,7 +3,7 @@ name: Deploy RomanceSpace Backend to VPS
 on:
   push:
     branches:
-      - main
+      - master
 
 jobs:
   deploy:
@@ -20,6 +20,6 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           script: |
             cd /opt/RomanceSpace-Backend
-            git pull origin main
+            git pull origin master
             npm install
             pm2 restart romancespace-api

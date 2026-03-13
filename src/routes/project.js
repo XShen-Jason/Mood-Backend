@@ -19,10 +19,10 @@ let memoryBlocklist = [];
 let blocklistLoaded = false;
 
 const QUOTA_DEFAULTS = {
-    'free': { limit: 1, dailyLimit: 5, label: '🌟 体验用户' },
-    'pro': { limit: 5, dailyLimit: 20, label: '💎 高级会员' },
-    'partner': { limit: 10, dailyLimit: 50, label: '👑 终身合伙人' },
-    'admin': { limit: 999, dailyLimit: 999, label: '🛡️ 系统管理员' }
+    'free': { limit: 1, dailyLimit: 5, minDomainLen: 3, label: '🌟 体验用户' },
+    'pro': { limit: 5, dailyLimit: 20, minDomainLen: 3, label: '💎 高级会员' },
+    'partner': { limit: 10, dailyLimit: 50, minDomainLen: 1, label: '👑 终身合伙人' },
+    'admin': { limit: 999, dailyLimit: 999, minDomainLen: 1, label: '🛡️ 系统管理员' }
 };
 
 let memoryQuotas = { ...QUOTA_DEFAULTS };
@@ -71,42 +71,56 @@ async function validateAndCheckQuota(userId, subdomain) {
         return { isValid: false, code: 4001, message: '请求必须包含 userId 以验证身份' };
     }
 
-    // 0. Zero-Quota Blocklist Check
+    // 1. Fetch user tier & profile once (needed for all checks)
+    const { data: profile, error: profileErr } = await supabase
+        .from('profiles')
+        .select('tier, daily_edit_count, last_edit_date')
+        .eq('id', userId)
+        .maybeSingle();
+
+    if (profileErr) throw new Error('Supabase Profile Error: ' + profileErr.message);
+    const tier = profile?.tier || 'free';
+
+    const subLow = subdomain.toLowerCase();
+    
+    await ensureQuotas();
+    const tierConfig = memoryQuotas[tier] || memoryQuotas['free'];
+    const minLen = tierConfig?.minDomainLen || 3;
+
+    // Tier-based Length Guard: protect 1-2 char domains (based on KV tier config)
+    if (subLow.length < minLen) {
+        return { isValid: false, code: 4002, message: `该域名前缀太短啦，您的等级至少需要 ${minLen} 个字符哦` };
+    }
+
+    // Hardcoded system-reserved words fallback
+    const HARDCODED_RESERVED = ['api', 'www', 'admin', 'rs', 'romance', 'space', 'help', 'docs', 'status'];
+    
     await ensureBlocklist();
-    if (memoryBlocklist.includes(subdomain.toLowerCase())) {
+    if (memoryBlocklist.includes(subLow) || HARDCODED_RESERVED.includes(subLow)) {
         return { isValid: false, code: 4003, message: '该域名为系统保留字或已禁用，请更换试试哦' };
     }
 
-    // 1. Check if subdomain already exists
+    // 3. Check if subdomain already exists
     const { data: existingProject, error: fetchErr } = await supabase
         .from('projects')
         .select('user_id')
         .eq('subdomain', subdomain)
         .maybeSingle();
 
-    if (fetchErr) {
-        throw new Error('Supabase Error: ' + fetchErr.message);
-    }
+    if (fetchErr) throw new Error('Supabase Fetch Error: ' + fetchErr.message);
+
+    const today = new Date().toISOString().split('T')[0];
 
     if (existingProject) {
         // Domain is taken. Check ownership.
         if (existingProject.user_id !== userId) {
             return { isValid: false, code: 4010, message: '该域名前缀已被他人抢先使用，请更换试试哦' };
         }
-        // It's their domain = Update Scenario (A-2 / A-3)
-        // Check Daily Edit Quota
-        const { data: profile } = await supabase.from('profiles').select('tier, daily_edit_count, last_edit_date').eq('id', userId).maybeSingle();
-        const tier = profile?.tier || 'free';
-        const today = new Date().toISOString().split('T')[0];
         
-        await ensureQuotas();
-        const tierConfig = memoryQuotas[tier] || memoryQuotas['free'];
-        const maxDailyEdits = tierConfig?.dailyLimit || 5; // Default 5 for free
-        
+        // Ownership verified -> Update Scenario. Check Daily Edit Quota.
+        const maxDailyEdits = tierConfig?.dailyLimit || 5;
         let dailyCount = profile?.daily_edit_count || 0;
-        if (profile?.last_edit_date !== today) {
-            dailyCount = 0; // Reset for new day
-        }
+        if (profile?.last_edit_date !== today) dailyCount = 0; // Reset for new day
         
         if (dailyCount >= maxDailyEdits) {
             return { isValid: false, code: 4022, message: `今日修改次数已达上限 (${maxDailyEdits}次)，请明天再试或升级等级哦` };
@@ -114,20 +128,7 @@ async function validateAndCheckQuota(userId, subdomain) {
         
         return { isValid: true, mode: 'UPDATE', tier, dailyCount, today };
     } else {
-        // Domain is not taken = Create Scenario (A-1)
-        
-        // 1. Fetch user tier from profiles table
-        const { data: profile, error: profileErr } = await supabase
-            .from('profiles')
-            .select('tier')
-            .eq('id', userId)
-            .maybeSingle();
-
-        if (profileErr) throw new Error('Supabase Profile Error: ' + profileErr.message);
-        
-        const tier = profile?.tier || 'free';
-
-        // 2. Count existing projects
+        // Domain is not taken -> Create Scenario. Check Total Projects Quota.
         const { count, error: countErr } = await supabase
             .from('projects')
             .select('subdomain', { count: 'exact', head: true })
@@ -135,12 +136,7 @@ async function validateAndCheckQuota(userId, subdomain) {
 
         if (countErr) throw new Error('Supabase Count Error: ' + countErr.message);
 
-        // 3. Define and check quota mapping
-        await ensureQuotas();
-        
-        const tierConfig = memoryQuotas[tier] || memoryQuotas['free'];
         const maxDomains = tierConfig?.limit || 1;
-        
         if (count >= maxDomains) {
             return { 
                 isValid: false, 
@@ -148,8 +144,8 @@ async function validateAndCheckQuota(userId, subdomain) {
                 message: `您的账号额度已满 (${count}/${maxDomains})，无法创建更多页面。请联系管理员升级。` 
             };
         }
-
-        return { isValid: true, mode: 'CREATE', tier };
+        
+        return { isValid: true, mode: 'CREATE', tier, count, today };
     }
 }
 
@@ -412,6 +408,7 @@ router.get('/status/:userId', async (req, res) => {
         const tierConfig = memoryQuotas[tier] || memoryQuotas['free'];
         const maxDomains = tierConfig?.limit ?? 1;
         const maxDailyEdits = tierConfig?.dailyLimit ?? 5;
+        const minDomainLen = tierConfig?.minDomainLen ?? 3;
         const label = tierConfig?.label ?? '体验用户';
         
         const today = new Date().toISOString().split('T')[0];
@@ -425,7 +422,8 @@ router.get('/status/:userId', async (req, res) => {
                 count: count || 0,
                 maxDomains,
                 dailyUsedEdits,
-                maxDailyEdits
+                maxDailyEdits,
+                minDomainLen
             }
         });
     } catch (err) {
