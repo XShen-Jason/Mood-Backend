@@ -74,12 +74,13 @@ async function validateAndCheckQuota(userId, subdomain) {
     // 1. Fetch user tier & profile once (needed for all checks)
     const { data: profile, error: profileErr } = await supabase
         .from('profiles')
-        .select('tier, daily_edit_count, last_edit_date')
+        .select('tier, role, daily_edit_count, last_edit_date')
         .eq('id', userId)
         .maybeSingle();
 
     if (profileErr) throw new Error('Supabase Profile Error: ' + profileErr.message);
-    const tier = profile?.tier || 'free';
+    const dbTier = (profile?.tier || '').toLowerCase();
+    const tier = dbTier || (profile?.role === 'admin' ? 'admin' : 'free');
 
     const subLow = subdomain.toLowerCase();
     
@@ -149,16 +150,62 @@ async function validateAndCheckQuota(userId, subdomain) {
     }
 }
 
+// ── GET /api/project/config/tiers ─────────────────────────────────────────────
+// Public/Admin: Lists available tiers and their labels/limits
+router.get('/config/tiers', async (req, res) => {
+    try {
+        await ensureQuotas();
+        return res.json({ success: true, tiers: memoryQuotas });
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+// ── GET /api/project/config/sync-status ──────────────────────────────────────
+// Admin only: Compares memory state with KV state and STAGES fresh data
+router.get('/config/sync-status', requireAdmin, async (req, res) => {
+    try {
+        await ensureQuotas();
+        const [kvQuotas, kvBlocklist] = await Promise.all([
+            kvGet('__sys__quotas'),
+            kvGet('__sys__blocklist')
+        ]);
+        
+        const quotasSynced = JSON.stringify(kvQuotas) === JSON.stringify(memoryQuotas);
+        const blocklistSynced = JSON.stringify(kvBlocklist) === JSON.stringify(memoryBlocklist);
+
+        // Stage fresh data if drift detected
+        stagedQuotas = quotasSynced ? null : kvQuotas;
+        stagedBlocklist = blocklistSynced ? null : kvBlocklist;
+
+        return res.json({
+            success: true,
+            quotasSynced,
+            blocklistSynced,
+            isSynced: quotasSynced && blocklistSynced,
+            hasStagedData: !!(stagedQuotas || stagedBlocklist)
+        });
+    } catch (err) {
+        console.error('[project/sync-status]', err);
+        return res.status(500).json({ error: err.message });
+    }
+});
+
 // ── POST /api/project/config/refresh-blocklist ─────────────────────────────
 router.post('/config/refresh-blocklist', requireAdmin, async (req, res) => {
     try {
-        const list = await kvGet('__sys__blocklist');
-        if (Array.isArray(list)) {
-            memoryBlocklist = list.map(s => String(s).toLowerCase());
+        let newBlocklist;
+        if (stagedBlocklist) {
+            newBlocklist = stagedBlocklist;
+            stagedBlocklist = null;
+            console.log('[project/refresh-blocklist] Using STAGED data');
         } else {
-            memoryBlocklist = [];
+            newBlocklist = await kvGet('__sys__blocklist');
+            console.log('[project/refresh-blocklist] Fetching from KV (Fallback)');
         }
-        blocklistLoaded = true;
+        
+        memoryBlocklist = Array.isArray(newBlocklist) ? newBlocklist.map(s => String(s).toLowerCase()) : [];
+        blocklistLoaded = true; // Ensure blocklist is marked as loaded after refresh
         return res.json({ success: true, count: memoryBlocklist.length, message: 'Blocklist refreshed in memory' });
     } catch (err) {
         console.error('[project/refresh-blocklist]', err);
@@ -169,23 +216,46 @@ router.post('/config/refresh-blocklist', requireAdmin, async (req, res) => {
 // ── POST /api/project/config/refresh-quotas ─────────────────────────────────────────────
 router.post('/config/refresh-quotas', requireAdmin, async (req, res) => {
     try {
-        const list = await kvGet('__sys__quotas');
-        if (list && typeof list === 'object') {
-            // Re-merge with defaults to allow partial overrides
-            let newQuotas = { ...QUOTA_DEFAULTS };
-            for (const key in list) {
-                if (typeof list[key] === 'number') {
-                    newQuotas[key] = { ...QUOTA_DEFAULTS[key], limit: list[key] };
-                } else if (typeof list[key] === 'object') {
-                    newQuotas[key] = { ...QUOTA_DEFAULTS[key], ...list[key] };
-                }
-            }
+        let newQuotas;
+        if (stagedQuotas) {
+            newQuotas = stagedQuotas;
+            stagedQuotas = null;
+            console.log('[project/refresh-quotas] Using STAGED data');
+        } else {
+            newQuotas = await kvGet('__sys__quotas');
+            console.log('[project/refresh-quotas] Fetching from KV (Fallback)');
+        }
+
+        if (newQuotas) {
             memoryQuotas = newQuotas;
         }
         quotasLoaded = true;
-        return res.json({ success: true, quotas: memoryQuotas, message: 'Quotas and labels refreshed in memory' });
+        return res.json({ success: true, quotas: memoryQuotas, message: 'Quotas updated in memory' });
     } catch (err) {
         console.error('[project/refresh-quotas]', err);
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+// ── POST /api/project/config/update-user-tier ─────────────────────────────────────────────
+// Admin only: Updates a specific user's tier in Supabase
+router.post('/config/update-user-tier', requireAdmin, async (req, res) => {
+    try {
+        const { targetUserId, tier } = req.body;
+        if (!targetUserId || !tier) {
+            return res.status(400).json({ error: 'Missing targetUserId or tier' });
+        }
+
+        const { error } = await supabase
+            .from('profiles')
+            .update({ tier: tier.toLowerCase() })
+            .eq('id', targetUserId);
+
+        if (error) throw error;
+
+        return res.json({ success: true, message: `User tier successfully updated to ${tier}` });
+    } catch (err) {
+        console.error('[project/update-user-tier]', err);
         return res.status(500).json({ error: err.message });
     }
 });
