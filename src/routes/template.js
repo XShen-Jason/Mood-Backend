@@ -132,6 +132,7 @@ router.post('/upload', requireAdmin, upload.any(), async (req, res) => {
         let isStatic = true;
         let title = templateName; // Fallback to slug
         let tier = 'free'; // Default to Free
+        let price = 0;
         
         const metaFile = files.find((f) => f.fieldname === 'config.json' || f.fieldname === 'schema.json');
         if (metaFile) {
@@ -141,6 +142,7 @@ router.post('/upload', requireAdmin, upload.any(), async (req, res) => {
                 isStatic = schema.static === true || fields.length === 0;
                 if (schema.title) title = schema.title;
                 if (schema.tier === 'pro') tier = 'pro'; // Explicitly Pro
+                if (schema.price) price = schema.price;
             } catch (e) {
                 console.warn(`[template/upload] Failed to parse config.json for ${templateName}`);
             }
@@ -151,6 +153,7 @@ router.post('/upload', requireAdmin, upload.any(), async (req, res) => {
             name: templateName,
             title,
             tier,
+            price,
             version,
             fields,
             static: isStatic,
@@ -244,9 +247,10 @@ router.post('/sync-local', requireAdmin, async (req, res) => {
                 const isStatic = configJson?.static === true || fields.length === 0;
                 const title = configJson?.title || name;
                 const tier = configJson?.tier === 'pro' ? 'pro' : 'free';
+                const price = configJson?.price || 0;
 
                 await kvPut(`__tmpl__${name}`, {
-                    name, title, tier, version, fields, static: isStatic, updatedAt: new Date().toISOString()
+                    name, title, tier, price, version, fields, static: isStatic, updatedAt: new Date().toISOString()
                 });
                 results.push({ name, version, source: 'github' });
             }
@@ -290,9 +294,10 @@ router.post('/sync-local', requireAdmin, async (req, res) => {
                 const isStatic = configJson?.static === true || fields.length === 0;
                 const title = configJson?.title || name;
                 const tier = configJson?.tier === 'pro' ? 'pro' : 'free';
+                const price = configJson?.price || 0;
 
                 await kvPut(`__tmpl__${name}`, {
-                    name, title, tier, version, fields, static: isStatic, updatedAt: new Date().toISOString()
+                    name, title, tier, price, version, fields, static: isStatic, updatedAt: new Date().toISOString()
                 });
                 results.push({ name, version, source: 'local' });
             }
