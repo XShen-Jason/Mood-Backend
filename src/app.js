@@ -15,7 +15,7 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 
 const templateRouter = require('./routes/template');
-const projectRouter = require('./routes/project');
+const { router: projectRouter } = require('./routes/project');
 
 const app = express();
 

@@ -13,11 +13,14 @@ const { r2Put, r2Get, r2List, r2DeleteObjects } = require('../utils/r2');
 const { kvGet, kvPut, kvList, kvDelete } = require('../utils/kv');
 const { makeVersion } = require('../utils/mime');
 const { injectData } = require('../utils/html');
+const { supabase } = require('../utils/supabase');
+const { renderProjectInternal, memoryQuotas } = require('./project');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
 let cachedTemplates = null;
+const assetVersionCache = new Map();
 
 // Path where the static template list JSON is written.
 // Nginx serves this file directly at /templates.json — sub-5ms, zero Node.js overhead.
@@ -102,6 +105,79 @@ async function commitToGitHub(templateName, files) {
     }
 }
 
+/**
+ * Safely triggers an asynchronous re-render for all projects using a specific template.
+ * Designed for 2h2g VPS: Sequential processing + Batching + Delays.
+ */
+async function triggerBackgroundReRender(templateName) {
+    console.log(`[re-render] Scheduled re-render for projects using template: ${templateName}`);
+    
+    // Self-invoking async function to run in background
+    (async () => {
+        try {
+            let offset = 0;
+            const batchSize = 50;
+            let totalProcessed = 0;
+            let totalFailed = 0;
+
+            while (true) {
+                // 1. Fetch batch from Supabase (Joined with profiles for tier info)
+                const { data: projects, error } = await supabase
+                    .from('projects')
+                    .select('*, profiles(tier, role)')
+                    .eq('template_type', templateName)
+                    .range(offset, offset + batchSize - 1)
+                    .order('updated_at', { ascending: false });
+
+                if (error) {
+                    console.error(`[re-render] DB Fetch Error for ${templateName}:`, error.message);
+                    break;
+                }
+
+                if (!projects || projects.length === 0) break;
+
+                console.log(`[re-render] Processing batch of ${projects.length} users for ${templateName}...`);
+
+                // 2. Process sequentially to protect VPS CPU/Bandwidth
+                for (const project of projects) {
+                    try {
+                        // resolve tier config for this specific user
+                        const userTier = (project.profiles?.tier || project.profiles?.role || 'free').toLowerCase();
+                        const tierConfig = memoryQuotas[userTier] || memoryQuotas['free'];
+
+                        await renderProjectInternal({
+                            subdomain: project.subdomain,
+                            userId: project.user_id,
+                            type: project.template_type,
+                            data: project.data,
+                            showViralFooter: project.show_viral_footer,
+                            isUpdate: true,
+                            tierConfig: tierConfig
+                        });
+                        totalProcessed++;
+                    } catch (renderErr) {
+                        console.error(`[re-render] Failed for ${project.subdomain}:`, renderErr.message);
+                        totalFailed++;
+                    }
+                    
+                    // Delay between items (200ms = 5 pages per second max)
+                    await new Promise(resolve => setTimeout(resolve, 200)); 
+                }
+
+                if (projects.length < batchSize) break;
+                offset += batchSize;
+                
+                // Yield to event loop between batches
+                await new Promise(resolve => setImmediate(resolve));
+            }
+
+            console.log(`[re-render] FINISHED for ${templateName}. Success: ${totalProcessed}, Failed: ${totalFailed}`);
+        } catch (fatal) {
+            console.error(`[re-render] FATAL Background Error for ${templateName}:`, fatal.message);
+        }
+    })();
+}
+
 // ── POST /api/template/upload ─────────────────────────────────────────────────
 router.post('/upload', requireAdmin, upload.any(), async (req, res) => {
     try {
@@ -176,6 +252,11 @@ router.post('/upload', requireAdmin, upload.any(), async (req, res) => {
             });
         }
 
+        // Trigger Auto Re-render for all existing users of this template
+        triggerBackgroundReRender(templateName).catch(err => {
+            console.error('[template/upload] Re-render trigger failed:', err);
+        });
+
         return res.json({
             success: true,
             templateName,
@@ -217,9 +298,29 @@ router.post('/sync-local', requireAdmin, async (req, res) => {
 
             for (const name of folders) {
                 const version = makeVersion();
+
+                // 1. Fetch current metadata to check for changes
+                const existingMeta = await kvGet(`__tmpl__${name}`);
+                
+                // Get SHA of index.html for this template
                 const filesUrl = `${baseUrl}/${name}`;
                 const filesRes = await fetch(filesUrl, { headers: ghHeaders });
                 const filesData = await filesRes.json();
+                
+                const indexFile = Array.isArray(filesData) ? filesData.find(f => f.name === 'index.html') : null;
+                const configFile = Array.isArray(filesData) ? filesData.find(f => f.name === 'config.json' || f.name === 'schema.json') : null;
+                
+                // Combined SHA for detection (if either index or config changes, we sync)
+                const newGitSha = `${indexFile?.sha || ''}-${configFile?.sha || ''}`;
+
+                // Optimization: Skip if Git SHA hasn't changed
+                if (existingMeta && existingMeta.gitSha === newGitSha && !req.body.force) {
+                    console.log(`[sync/github] Template '${name}' unchanged (SHA: ${newGitSha}), skipping.`);
+                    results.push({ name, version: existingMeta.version, source: 'github', skipped: true });
+                    continue;
+                }
+
+                console.log(`[sync/github] Template '${name}' changed or new. Syncing...`);
                 
                 // Track files for this template
                 const uploadedFiles = [];
@@ -250,9 +351,14 @@ router.post('/sync-local', requireAdmin, async (req, res) => {
                 const price = configJson?.price || 0;
 
                 await kvPut(`__tmpl__${name}`, {
-                    name, title, tier, price, version, fields, static: isStatic, updatedAt: new Date().toISOString()
+                    name, title, tier, price, version, fields, static: isStatic, 
+                    updatedAt: new Date().toISOString(),
+                    gitSha: newGitSha // Store SHA for next sync detection
                 });
                 results.push({ name, version, source: 'github' });
+
+                // Trigger background re-render for existing users of this template
+                triggerBackgroundReRender(name).catch(err => console.error(`[sync/github] Re-render trigger failed for ${name}:`, err));
             }
         } 
         // --- Option B: Fallback to Local Filesystem ---
@@ -266,6 +372,18 @@ router.post('/sync-local', requireAdmin, async (req, res) => {
                 const dirPath = path.join(localPath, name);
                 const indexHtml = path.join(dirPath, 'index.html');
                 if (!fs.existsSync(indexHtml)) continue;
+
+                const mtime = fs.statSync(indexHtml).mtimeMs;
+                const existingMeta = await kvGet(`__tmpl__${name}`);
+
+                // Optimization: Skip if Local Modification Time hasn't changed
+                if (existingMeta && existingMeta.localMtime === mtime && !req.body.force) {
+                    console.log(`[sync/local] Template '${name}' unchanged (mtime: ${mtime}), skipping.`);
+                    results.push({ name, version: existingMeta.version, source: 'local', skipped: true });
+                    continue;
+                }
+
+                console.log(`[sync/local] Template '${name}' changed or new. Syncing...`);
 
                 const version = makeVersion();
                 const files = [];
@@ -297,9 +415,14 @@ router.post('/sync-local', requireAdmin, async (req, res) => {
                 const price = configJson?.price || 0;
 
                 await kvPut(`__tmpl__${name}`, {
-                    name, title, tier, price, version, fields, static: isStatic, updatedAt: new Date().toISOString()
+                    name, title, tier, price, version, fields, static: isStatic, 
+                    updatedAt: new Date().toISOString(),
+                    localMtime: mtime // Store mtime for next sync detection
                 });
                 results.push({ name, version, source: 'local' });
+
+                // Trigger background re-render
+                triggerBackgroundReRender(name).catch(err => console.error(`[sync/local] Re-render trigger failed for ${name}:`, err));
             }
         } 
         else {
@@ -507,7 +630,7 @@ router.get('/preview/:name', async (req, res) => {
 // IMPORTANT: This wildcard route MUST be defined AFTER all named routes (/list,
 // /raw, /preview) so it does not shadow them. It handles the case where this
 // router is mounted at /assets in app.js: /assets/anniversary/style.css → type=anniversary, filepath=style.css
-const assetVersionCache = new Map();
+
 
 router.get('/:type/*', async (req, res) => {
     try {

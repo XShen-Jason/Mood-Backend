@@ -310,66 +310,77 @@ router.post('/render', async (req, res) => {
         if (!authCheck.isValid) {
             return res.status(400).json({ code: authCheck.code, message: authCheck.message, data: null });
         }
-        const isUpdate = (authCheck.mode === 'UPDATE');
-        const userTier = authCheck.tier || 'free';
+        // 3. Perform the actual rendering and persistence
+        const renderResult = await renderProjectInternal({
+            subdomain,
+            userId,
+            type,
+            data,
+            showViralFooter,
+            isUpdate: (authCheck.mode === 'UPDATE'),
+            tierConfig: authCheck.tierConfig
+        });
 
-        // Force viral footer if tier doesn't allow hiding it
-        const tierConfig = authCheck.tierConfig;
-        const allowHide = tierConfig?.allowHideFooter ?? false;
-        const finalShowViralFooter = allowHide ? (showViralFooter !== false) : true;
-
-        // Tracking daily edits in profiles table
-        if (isUpdate) {
-            try {
-                await supabase.from('profiles').update({
-                    daily_edit_count: (authCheck.dailyCount || 0) + 1,
-                    last_edit_date: authCheck.today
-                }).eq('id', userId);
-            } catch (e) {
-                console.error('[Quota Update Error]', e);
+        return res.status(200).json({
+            code: 0,
+            message: "网页生成成功",
+            data: {
+                url: renderResult.url
             }
-        }
+        });
 
-        // 3. Load template metadata from target R2 directory/KV
-        const meta = await kvGet(`__tmpl__${type}`);
-        if (!meta) {
-            return res.status(404).json({ code: 4040, message: `模板 ${type} 不存在或未发布`, data: null });
-        }
+    } catch (err) {
+        console.error('[project/render Fatal Error]', err);
+        return res.status(500).json({ code: 5000, message: '服务器内部渲染错误', error: err.message, data: null });
+    }
+});
 
-        // 4. Fetch Template base files from R2
-        const [htmlBuf, metaBuf] = await Promise.all([
-            r2Get(`templates/${type}/${meta.version}/index.html`),
-            r2Get(`templates/${type}/${meta.version}/config.json`)
-                .then(b => b || r2Get(`templates/${type}/${meta.version}/schema.json`)),
-        ]);
+/**
+ * Core rendering logic extracted for background re-renders.
+ */
+async function renderProjectInternal({ subdomain, userId, type, data, showViralFooter, isUpdate, tierConfig }) {
+    // 1. Force viral footer if tier doesn't allow hiding it
+    const allowHide = tierConfig?.allowHideFooter ?? false;
+    const finalShowViralFooter = allowHide ? (showViralFooter !== false) : true;
 
-        if (!htmlBuf) {
-            return res.status(404).json({ code: 4041, message: '核心模板源文件缺失', data: null });
-        }
+    // 2. Load template metadata from KV
+    const meta = await kvGet(`__tmpl__${type}`);
+    if (!meta) {
+        throw new Error(`模板 ${type} 不存在或未发布`);
+    }
 
-        const schema = metaBuf ? JSON.parse(metaBuf.toString('utf-8')) : null;
+    // 3. Fetch Template base files from R2
+    const [htmlBuf, metaBuf] = await Promise.all([
+        r2Get(`templates/${type}/${meta.version}/index.html`),
+        r2Get(`templates/${type}/${meta.version}/config.json`)
+            .then(b => b || r2Get(`templates/${type}/${meta.version}/schema.json`)),
+    ]);
 
-        // 5. Render HTML with user data
-        let rendered = injectData(htmlBuf.toString('utf-8'), data, schema);
+    if (!htmlBuf) {
+        throw new Error('核心模板源文件缺失');
+    }
 
-        // 5.5 Fetch Inviter Code and Inject Viral Footer
+    const schema = metaBuf ? JSON.parse(metaBuf.toString('utf-8')) : null;
+
+    // 4. Render HTML with user data
+    let rendered = injectData(htmlBuf.toString('utf-8'), data, schema);
+
+    // 5. Inject Viral Footer if active
+    if (finalShowViralFooter) {
         let inviteCode = '';
-        if (finalShowViralFooter) {
-            try {
-                const { data: profile } = await supabase
-                    .from('profiles')
-                    .select('invite_code')
-                    .eq('id', userId)
-                    .maybeSingle();
-                inviteCode = profile?.invite_code || '';
-            } catch (e) {
-                console.error('[Invite Code Fetch Error]', e);
-            }
+        try {
+            const { data: profile } = await supabase
+                .from('profiles')
+                .select('invite_code')
+                .eq('id', userId)
+                .maybeSingle();
+            inviteCode = profile?.invite_code || '';
+        } catch (e) {
+            console.error('[Invite Code Fetch Error]', e);
         }
 
-        if (finalShowViralFooter) {
-            const referralLink = `https://www.885201314.xyz/builder/${type}?ref=${inviteCode}&src=footer`;
-            const footerHtml = `
+        const referralLink = `https://www.885201314.xyz/builder/${type}?ref=${inviteCode}&src=footer`;
+        const footerHtml = `
     <!-- RomanceSpace Viral Floating Footer -->
     <div style="position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 999999; width: auto; max-width: 90%; white-space: nowrap; pointer-events: none;">
         <div style="pointer-events: auto; display: inline-block; background: rgba(255, 255, 255, 0.75); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); padding: 8px 18px; border-radius: 50px; box-shadow: 0 4px 15px rgba(0,0,0,0.08); border: 1px solid rgba(252, 228, 236, 0.5); text-align: center; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
@@ -383,82 +394,62 @@ router.post('/render', async (req, res) => {
         </div>
     </div>`;
 
-            const bodyEndIdx = rendered.lastIndexOf('</body>');
-            if (bodyEndIdx !== -1) {
-                rendered = rendered.substring(0, bodyEndIdx) + footerHtml + '\n' + rendered.substring(bodyEndIdx);
-            } else {
-                rendered += '\n' + footerHtml;
-            }
-        }
-
-        // 6. Inject <base> tag so relative assets load from the CDN
-        const baseTag = `<base href="https://www.885201314.xyz/assets/${type}/" />`;
-        const headRegex = /<head[^>]*>/i;
-        if (headRegex.test(rendered)) {
-            rendered = rendered.replace(headRegex, (match) => `${match}\n    ${baseTag}`);
+        const bodyEndIdx = rendered.lastIndexOf('</body>');
+        if (bodyEndIdx !== -1) {
+            rendered = rendered.substring(0, bodyEndIdx) + footerHtml + '\n' + rendered.substring(bodyEndIdx);
         } else {
-            rendered = `${baseTag}\n${rendered}`;
+            rendered += '\n' + footerHtml;
         }
-
-        // 7. Push final static HTML to R2
-        await r2Put(`pages/${subdomain}/index.html`, Buffer.from(rendered, 'utf-8'), 'text/html;charset=UTF-8');
-
-        // 7. Push lightweight router config to KV (Edge router uses status:1 to allow traffic)
-        // Optimization: only write to KV if new or template type/footer changed (Reduce KV Write quota)
-        const oldConfig = isUpdate ? await kvGet(subdomain) : null;
-        const configDiffers = !oldConfig 
-            || oldConfig.template !== type 
-            || oldConfig.status !== 1
-            || oldConfig.showViralFooter !== finalShowViralFooter;
-
-        if (configDiffers) {
-            await kvPut(subdomain, { status: 1, template: type, showViralFooter: finalShowViralFooter });
-            console.log(`[project/render] KV Route Updated for ${subdomain} (Type: ${type}, Footer: ${finalShowViralFooter})`);
-        } else {
-            console.log(`[project/render] KV Route Skip (Unchanged) for ${subdomain}`);
-        }
-
-        // 8. (Removed legacy KV user index - now handled by Supabase SQL queries)
-
-        // 9. Persist the transaction into Supabase PostgreSQL
-        // We use upsert allowing overriding config if it's the same subdomain
-        const { error: upsertErr } = await supabase
-            .from('projects')
-            .upsert({
-                subdomain,
-                user_id: userId,
-                template_type: type,
-                data: data,
-                show_viral_footer: finalShowViralFooter,
-                updated_at: new Date().toISOString()
-            }, { onConflict: 'subdomain' });
-
-        if (upsertErr) {
-            console.error('[Supabase Upsert Error]:', upsertErr);
-            // Although DB failed, R2/KV succeeded. Log error but don't crash user.
-        }
-
-        // 10. Purge CDN cache if this is an update
-        const pageUrl = `https://${subdomain}.${BASE_DOMAIN}/`;
-        if (isUpdate) {
-            // Purge both with and without trailing slash to be safe
-            await purgeCacheUrls([pageUrl, pageUrl.slice(0, -1)]);
-        }
-
-        // 11. Return standard successful response
-        return res.status(200).json({
-            code: 0,
-            message: "网页生成成功",
-            data: {
-                url: pageUrl
-            }
-        });
-
-    } catch (err) {
-        console.error('[project/render Fatal Error]', err);
-        return res.status(500).json({ code: 5000, message: '服务器内部渲染错误', error: err.message, data: null });
     }
-});
+
+    // 6. Inject <base> tag so relative assets load from the CDN
+    const baseTag = `<base href="https://www.885201314.xyz/assets/${type}/" />`;
+    const headRegex = /<head[^>]*>/i;
+    if (headRegex.test(rendered)) {
+        rendered = rendered.replace(headRegex, (match) => `${match}\n    ${baseTag}`);
+    } else {
+        rendered = `${baseTag}\n${rendered}`;
+    }
+
+    // 7. Push final static HTML to R2
+    await r2Put(`pages/${subdomain}/index.html`, Buffer.from(rendered, 'utf-8'), 'text/html;charset=UTF-8');
+
+    // 8. Update KV Route
+    const oldConfig = isUpdate ? await kvGet(subdomain) : null;
+    const configDiffers = !oldConfig 
+        || oldConfig.template !== type 
+        || oldConfig.status !== 1
+        || oldConfig.showViralFooter !== finalShowViralFooter;
+
+    if (configDiffers) {
+        await kvPut(subdomain, { status: 1, template: type, showViralFooter: finalShowViralFooter });
+    }
+
+    // 9. Persist to Supabase
+    const { error: upsertErr } = await supabase
+        .from('projects')
+        .upsert({
+            subdomain,
+            user_id: userId,
+            template_type: type,
+            data: data,
+            show_viral_footer: finalShowViralFooter,
+            updated_at: new Date().toISOString()
+        }, { onConflict: 'subdomain' });
+
+    if (upsertErr) {
+        console.error('[Supabase Upsert Error]:', upsertErr);
+    }
+
+    // 10. Purge cache
+    const pageUrl = `https://${subdomain}.${BASE_DOMAIN}/`;
+    if (isUpdate) {
+        await purgeCacheUrls([pageUrl, pageUrl.slice(0, -1)]);
+    }
+
+    return { url: pageUrl };
+}
+
 
 // ── GET /api/project/:subdomain ────────────────────────────────────────────
 // Internal Admin route
@@ -574,4 +565,4 @@ router.get('/config-by-subdomain/:subdomain', async (req, res) => {
     }
 });
 
-module.exports = router;
+module.exports = { router, renderProjectInternal, memoryQuotas };
