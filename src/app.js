@@ -1,5 +1,5 @@
 /**
- * RomanceSpace Backend — Express entry point
+ * Backend API — Express entry point
  * CQRS write-side: all writes to R2/KV happen here, never in the Worker.
  *
  * v2 additions:
@@ -50,7 +50,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // ── Health check ─────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
-    res.json({ ok: true, service: 'romancespace-backend', ts: new Date().toISOString() });
+    res.json({ ok: true, service: 'backend-api', ts: new Date().toISOString() });
 });
 
 // ── API Routes (rate-limited) ────────────────────────────────────────────────
@@ -64,9 +64,8 @@ app.use('/api/project', projectRouter);
 app.use('/assets', templateRouter);
 
 // ── Frontend Static Site Serving ─────────────────────────────────────────────
-// Serve the compiled React bundle.  Run `npm run build` in RomanceSpace-Frontend first.
-// The dist/ folder is expected to live at: ../RomanceSpace-Frontend/dist/
-const FRONTEND_DIST = path.join(__dirname, '../../RomanceSpace-Frontend/dist');
+// Serve the compiled React bundle from a configured path, or fallback to relative.
+const FRONTEND_DIST = process.env.FRONTEND_DIST_PATH || path.join(__dirname, '../../MoodSpace-Frontend/dist');
 app.use(express.static(FRONTEND_DIST));
 
 // SPA fallback: for any unknown path (e.g. /builder/anniversary), return index.html
@@ -84,6 +83,6 @@ app.use((err, _req, res, _next) => {
 // ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT ?? 3000;
 app.listen(PORT, () => {
-    console.log(`[romancespace-backend] Listening on http://0.0.0.0:${PORT}`);
-    console.log(`[romancespace-backend] Serving frontend from: ${FRONTEND_DIST}`);
+    console.log(`[backend-api] Listening on http://0.0.0.0:${PORT}`);
+    console.log(`[backend-api] Serving frontend from: ${FRONTEND_DIST}`);
 });

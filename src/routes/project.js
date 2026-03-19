@@ -13,7 +13,7 @@ const { supabase } = require('../utils/supabase'); // Added Supabase Client
 
 const router = express.Router();
 
-const BASE_DOMAIN = '885201314.xyz';
+const BASE_DOMAIN = process.env.CF_ZONE_NAME || 'moodspace.xyz';
 
 let memoryBlocklist = [];
 let blocklistLoaded = false;
@@ -379,13 +379,13 @@ async function renderProjectInternal({ subdomain, userId, type, data, showViralF
             console.error('[Invite Code Fetch Error]', e);
         }
 
-        const referralLink = `https://www.885201314.xyz/builder/${type}?ref=${inviteCode}&src=footer`;
+        const referralLink = `${process.env.FRONTEND_URL || 'https://www.moodspace.xyz'}/builder/${type}?ref=${inviteCode}&src=footer`;
         const footerHtml = `
-    <!-- RomanceSpace Viral Floating Footer -->
+    <!-- ${process.env.APP_NAME || 'Mood Space'} Viral Floating Footer -->
     <div style="position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 999999; width: auto; max-width: 90%; white-space: nowrap; pointer-events: none;">
         <div style="pointer-events: auto; display: inline-block; background: rgba(255, 255, 255, 0.75); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); padding: 8px 18px; border-radius: 50px; box-shadow: 0 4px 15px rgba(0,0,0,0.08); border: 1px solid rgba(252, 228, 236, 0.5); text-align: center; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
             <p style="margin: 0; color: #777; font-size: 12px; letter-spacing: 0.2px;">
-                <span style="color: #ff477e; font-weight: 500;">❤️ RomanceSpace</span>
+                <span style="color: #ff477e; font-weight: 500;">❤️ ${process.env.APP_NAME || 'Mood Space'}</span>
                 <span style="margin: 0 6px; opacity: 0.3;">|</span>
                 <a href="${referralLink}" target="_blank" rel="noopener noreferrer" style="color: #ff477e; text-decoration: none; font-weight: 500;">
                     制作同款网页 ✨
@@ -403,7 +403,7 @@ async function renderProjectInternal({ subdomain, userId, type, data, showViralF
     }
 
     // 6. Inject <base> tag so relative assets load from the CDN
-    const baseTag = `<base href="https://www.885201314.xyz/assets/${type}/" />`;
+    const baseTag = `<base href="${process.env.FRONTEND_URL || 'https://www.moodspace.xyz'}/assets/${type}/" />`;
     const headRegex = /<head[^>]*>/i;
     if (headRegex.test(rendered)) {
         rendered = rendered.replace(headRegex, (match) => `${match}\n    ${baseTag}`);

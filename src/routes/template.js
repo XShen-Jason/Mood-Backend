@@ -65,7 +65,7 @@ async function commitToGitHub(templateName, files) {
 
     const headers = {
         'Authorization': `token ${token}`,
-        'User-Agent': 'RomanceSpace-Backend',
+        'User-Agent': 'Template-Sync-Client',
         'Accept': 'application/vnd.github.v3+json'
     };
 
@@ -194,7 +194,7 @@ router.post('/upload', requireAdmin, upload.any(), async (req, res) => {
             fields,
             static: isStatic,
             filesUploaded: uploadedFiles,
-            previewUrl: `https://www.885201314.xyz/preview/${templateName}`,
+            previewUrl: `${process.env.FRONTEND_URL || 'https://www.moodspace.xyz'}/preview/${templateName}`,
             githubSynced: syncToGithub
         });
     } catch (err) {
@@ -209,7 +209,7 @@ router.post('/sync-local', requireAdmin, async (req, res) => {
     try {
         const repoOwner = process.env.TEMPLATES_REPO_OWNER;
         const repoName = process.env.TEMPLATES_REPO_NAME;
-        const localPath = process.env.TEMPLATES_LOCAL_PATH || path.join(__dirname, '../../../RomanceSpace-Templates/src');
+        const localPath = process.env.TEMPLATES_LOCAL_PATH || path.join(__dirname, '../../../MoodSpace-Templates/src');
 
         const results = [];
         
@@ -217,7 +217,7 @@ router.post('/sync-local', requireAdmin, async (req, res) => {
         if (repoOwner && repoName) {
             console.log(`[sync] Fetching from GitHub: ${repoOwner}/${repoName}...`);
             const baseUrl = `https://api.github.com/repos/${repoOwner}/${repoName}/contents/src`;
-            const ghHeaders = { 'User-Agent': 'RomanceSpace-Backend' };
+            const ghHeaders = { 'User-Agent': 'Template-Sync-Client' };
             if (process.env.GITHUB_TOKEN) ghHeaders['Authorization'] = `token ${process.env.GITHUB_TOKEN}`;
 
             const repoRes = await fetch(baseUrl, { headers: ghHeaders });
@@ -577,7 +577,7 @@ router.get('/preview/:name', async (req, res) => {
 
         // 1. Inject <base> tag so relative assets (CSS/JS) load from the versions path in CDN
         // Note: Deployment guide suggests assets are served from /assets/:name/ which maps to R2
-        const baseTag = `<base href="https://www.885201314.xyz/assets/${name}/" />`;
+        const baseTag = `<base href="${process.env.FRONTEND_URL || 'https://www.moodspace.xyz'}/assets/${name}/" />`;
 
         // Robust injection: find <head> case-insensitive, or prepend if missing
         const headRegex = /<head[^>]*>/i;
