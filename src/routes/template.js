@@ -527,6 +527,43 @@ router.get('/raw/:name', async (req, res) => {
     }
 });
 
+// ── PATCH /api/template/:name/status ────────────────────────────────────────
+// Admin only: Update template status logically without destructive actions
+router.patch('/:name/status', requireAdmin, async (req, res) => {
+    try {
+        const { name } = req.params;
+        const { status } = req.body;
+        
+        if (!['active', 'offline', 'pending', 'rejected', 'archived'].includes(status)) {
+            return res.status(400).json({ error: 'Invalid status provided' });
+        }
+
+        const key = `__tmpl__${name}`;
+        const existingMeta = await kvGet(key);
+        
+        if (!existingMeta) {
+            return res.status(404).json({ error: `Template '${name}' not found in KV` });
+        }
+
+        existingMeta.status = status;
+        existingMeta.updatedAt = new Date().toISOString();
+        
+        await kvPut(key, existingMeta);
+        
+        // Purge cache and static list
+        cachedTemplates = null;
+        await rebuildStaticTemplateList();
+        
+        return res.json({ 
+            success: true, 
+            message: `模板 '${name}' 状态已成功切换为 ${status}` 
+        });
+    } catch (err) {
+        console.error('[template/status]', err);
+        return res.status(500).json({ error: err.message });
+    }
+});
+
 // ── DELETE /api/template/:name ──────────────────────────────────────────────
 // Admin only: Purge a template's metadata from KV and cleanup R2
 router.delete('/:name', requireAdmin, async (req, res) => {
