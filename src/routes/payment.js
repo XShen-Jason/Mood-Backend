@@ -79,7 +79,7 @@ router.post('/create', async (req, res) => {
         }
 
         // 3. Determine actual amount (First month vs Renewal)
-        // Fetch user's current tier to decide which price to use
+        // Explicit logic only — no silent fallback to discount_rate to avoid billing errors
         const { data: profile } = await supabase
             .from('profiles')
             .select('tier')
@@ -87,21 +87,32 @@ router.post('/create', async (req, res) => {
             .maybeSingle();
         
         const isRenewal = profile && profile.tier && profile.tier.toLowerCase() === tier.toLowerCase();
-        
+
         let actualAmount;
-        if (isRenewal && config.renewal_price) {
-            actualAmount = config.renewal_price;
-        } else if (config.first_month_price) {
-            actualAmount = config.first_month_price;
+        if (isRenewal) {
+            // Renewal: use renewal_price if set, otherwise fall back to base_price (NOT calculated from discount)
+            if (config.renewal_price != null && config.renewal_price > 0) {
+                actualAmount = config.renewal_price;
+            } else if (config.base_price != null && config.base_price > 0) {
+                actualAmount = config.base_price;
+            } else {
+                return res.status(400).json({ success: false, error: 'Pricing config is missing valid renewal_price and base_price' });
+            }
         } else {
-            // Fallback to base price if no specific prices are set
-            const discount = parseFloat(config.discount_rate) || 1.0;
-            actualAmount = Math.floor(config.base_price * discount);
+            // First purchase: use first_month_price if set, otherwise base_price
+            if (config.first_month_price != null && config.first_month_price > 0) {
+                actualAmount = config.first_month_price;
+            } else if (config.base_price != null && config.base_price > 0) {
+                actualAmount = config.base_price;
+            } else {
+                return res.status(400).json({ success: false, error: 'Pricing config is missing valid first_month_price and base_price' });
+            }
         }
 
-        // Sanity check constraints
-        if (actualAmount <= 0 || actualAmount > 1000000) { // 10k RMB safety cap
-            return res.status(400).json({ success: false, error: 'Calculated amount fails safety constraints' });
+        // Strict sanity check — amount must be a positive integer in cents
+        actualAmount = Math.round(actualAmount); // Guard against any float sneak-in
+        if (!Number.isInteger(actualAmount) || actualAmount <= 0 || actualAmount > 1000000) { // Max 10,000 RMB
+            return res.status(400).json({ success: false, error: 'Calculated amount fails safety constraints (must be 1–1,000,000 cents)' });
         }
 
         // 4. Create Order
@@ -416,13 +427,27 @@ router.post('/admin/pricing', requireAdminKey, async (req, res) => {
             return res.status(400).json({ success: false, error: 'Missing required fields: tier, duration_months, base_price' });
         }
 
+        // All price fields MUST be stored as whole integers (cents).
+        // Use Math.round() to guard against any floating-point values sent from clients.
+        const parseCents = (val) => {
+            if (val == null || val === '') return null;
+            const n = Math.round(parseFloat(val));
+            if (!Number.isInteger(n) || n < 0) throw new Error(`Invalid price value: ${val}`);
+            return n;
+        };
+
+        const basePriceCents = parseCents(base_price);
+        if (!basePriceCents || basePriceCents <= 0) {
+            return res.status(400).json({ success: false, error: 'base_price must be a positive integer (cents)' });
+        }
+
         const payload = {
             tier,
             duration_months: parseInt(duration_months),
             display_name: display_name || null,
-            base_price: parseInt(base_price),
-            first_month_price: first_month_price ? parseInt(first_month_price) : null,
-            renewal_price: renewal_price ? parseInt(renewal_price) : null,
+            base_price: basePriceCents,
+            first_month_price: parseCents(first_month_price),
+            renewal_price: parseCents(renewal_price),
             discount_label: discount_label || null,
             is_active: is_active !== undefined ? Boolean(is_active) : true,
             sort_order: sort_order ? parseInt(sort_order) : 0,
