@@ -23,9 +23,10 @@ function escapeHtml(str) {
  * @returns {string}
  */
 function injectData(html, data, schema) {
-  return html.replace(/\{\{(\w+)\}\}/g, (match, key) => {
-    const raw = data[key];
-    const field = schema?.fields?.find((f) => (f.id === key || f.key === key || f === key));
+  return html.replace(/\{\{([^}]+)\}\}/g, (match, key) => {
+    const k = key.trim();
+    const raw = data[k];
+    const field = schema?.fields?.find((f) => (f.id === k || f.key === k || f === k));
 
     const resolve = (val) => {
       if (Array.isArray(val)) {
