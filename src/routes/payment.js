@@ -38,12 +38,22 @@ router.get('/pricing', async (req, res) => {
             profile = await getProfileWithSubscriptionSync(userId);
         }
 
+        // purchased_tiers is now a server-side field — zero extra queries needed
+        const purchasedTiers = Array.isArray(profile?.purchased_tiers) ? profile.purchased_tiers : [];
+
         const enriched = data.map(config => {
-            const isRenewal = profile && 
-                             profile.tier === config.tier && 
-                             profile.subscription_expires_at && 
+            const isRenewal = profile &&
+                             profile.tier === config.tier &&
+                             profile.subscription_expires_at &&
                              new Date(profile.subscription_expires_at) > new Date();
-            return { ...config, is_renewal: !!isRenewal };
+
+            const isReturning = !isRenewal && purchasedTiers.includes(config.tier);
+
+            return { 
+                ...config, 
+                is_renewal: !!isRenewal,
+                is_returning: isReturning
+            };
         });
 
         return res.json({ success: true, data: enriched });
@@ -83,34 +93,40 @@ router.post('/create', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Invalid or inactive pricing tier' });
         }
 
-        // 3. Determine actual amount (First month vs Renewal)
-        // Explicit logic only — no silent fallback to discount_rate to avoid billing errors
+        // 2. Fetch profile with real-time subscription sync
         const profile = await getProfileWithSubscriptionSync(userId);
-        
-        const isRenewal = profile && 
-                         profile.tier === tier && 
-                         profile.subscription_expires_at && 
+        if (!profile) {
+            return res.status(404).json({ success: false, error: 'User profile not found' });
+        }
+
+        const isRenewal = profile &&
+                         profile.tier === tier &&
+                         profile.subscription_expires_at &&
                          new Date(profile.subscription_expires_at) > new Date();
+
+        // Enforce allow_renewal: block renewing a non-renewable config
+        if (isRenewal && config.allow_renewal === false) {
+            return res.status(403).json({ success: false, error: '该套餐为一次性优惠套餐，不支持续费' });
+        }
+
+        // Use profile.purchased_tiers (server-side cache) — no extra DB query
+        const purchasedTiers = Array.isArray(profile?.purchased_tiers) ? profile.purchased_tiers : [];
+        const hasBoughtBefore = purchasedTiers.includes(tier);
 
         let actualAmount;
         if (isRenewal) {
-            // Renewal: use renewal_price if set, otherwise fall back to base_price (NOT calculated from discount)
-            if (config.renewal_price != null && config.renewal_price > 0) {
-                actualAmount = config.renewal_price;
-            } else if (config.base_price != null && config.base_price > 0) {
-                actualAmount = config.base_price;
-            } else {
-                return res.status(400).json({ success: false, error: 'Pricing config is missing valid renewal_price and base_price' });
-            }
+            // Case 1: Active Renewal
+            actualAmount = (config.renewal_price != null && config.renewal_price > 0)
+                ? config.renewal_price
+                : config.base_price;
+        } else if (hasBoughtBefore) {
+            // Case 2: Returning User (standard price — first-month promo expired)
+            actualAmount = config.base_price;
         } else {
-            // First purchase: use first_month_price if set, otherwise base_price
-            if (config.first_month_price != null && config.first_month_price > 0) {
-                actualAmount = config.first_month_price;
-            } else if (config.base_price != null && config.base_price > 0) {
-                actualAmount = config.base_price;
-            } else {
-                return res.status(400).json({ success: false, error: 'Pricing config is missing valid first_month_price and base_price' });
-            }
+            // Case 3: Truly First Purchase (introductory)
+            actualAmount = (config.first_month_price != null && config.first_month_price > 0)
+                ? config.first_month_price
+                : config.base_price;
         }
 
         // Strict sanity check — amount must be a positive integer in cents
