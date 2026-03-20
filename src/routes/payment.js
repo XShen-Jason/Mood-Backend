@@ -151,12 +151,19 @@ router.post('/create', async (req, res) => {
         }
 
         // 5. Generate Payment URL (Real ZhifuFM integration)
-        const payUrl = await requestZhifuFmUrl(orderNo, actualAmount, payType);
-        if (!payUrl) {
+        const zfmRes = await requestZhifuFmUrl(orderNo, actualAmount, payType);
+        
+        if (!zfmRes.success) {
+            console.error('[payment/create] Gateway Error:', zfmRes.msg);
             // Soft delete order since gateway rejected it
             await supabase.from('orders').update({ deleted_at: new Date().toISOString() }).eq('order_no', orderNo);
-            return res.status(500).json({ success: false, error: 'Payment gateway rejected order' });
+            return res.status(400).json({ 
+                success: false, 
+                error: `Payment gateway rejected order: ${zfmRes.msg || 'Unknown gateway error'}` 
+            });
         }
+
+        const payUrl = zfmRes.payUrl;
 
         return res.json({ 
             success: true, 
@@ -201,8 +208,11 @@ async function requestZhifuFmUrl(orderNo, amountCents, payType) {
             returnUrl: returnUrl,
             payType: payType || 'alipay',
             sign: sign,
-            returnType: 'json'
+            returnType: 'json',
+            apiMode: 'post_form' // Ensure POST callback to match our router.post('/notify')
         });
+
+        console.log('[requestZhifuFmUrl] Requesting:', `${BASE_API_URL}/startOrder`, params.toString());
 
         const res = await fetch(`${BASE_API_URL}/startOrder`, {
             method: 'POST',
@@ -211,14 +221,15 @@ async function requestZhifuFmUrl(orderNo, amountCents, payType) {
         });
 
         const data = await res.json();
-        if (data.success && data.data && data.data.payUrl) {
-            return data.data.payUrl;
+        if (data && data.success && data.data && data.data.payUrl) {
+            return { success: true, payUrl: data.data.payUrl };
+        } else {
+            console.error('[requestZhifuFmUrl] Gateway rejected:', data);
+            return { success: false, msg: data ? data.msg : 'Gateway returned empty response' };
         }
-        console.error('[requestZhifuFmUrl] Gateway error:', data);
-        return null;
     } catch(e) {
         console.error('[requestZhifuFmUrl] Fatal:', e);
-        return null;
+        return { success: false, msg: e.message };
     }
 }
 
