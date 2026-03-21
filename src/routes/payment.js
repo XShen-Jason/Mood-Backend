@@ -1,6 +1,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const { supabase, getProfileWithSubscriptionSync } = require('../utils/supabase');
+const { ensureQuotas, memoryQuotas } = require('./project');
 
 // For node-fetch v3 (ESM) in CJS environment
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
@@ -38,6 +39,9 @@ router.get('/pricing', async (req, res) => {
             profile = await getProfileWithSubscriptionSync(userId);
         }
 
+        // Ensure we have latest quotas loaded from KV
+        await ensureQuotas();
+
         // purchased_tiers is now a server-side field — zero extra queries needed
         const purchasedTiers = Array.isArray(profile?.purchased_tiers) ? profile.purchased_tiers : [];
 
@@ -48,11 +52,15 @@ router.get('/pricing', async (req, res) => {
                              new Date(profile.subscription_expires_at) > new Date();
 
             const isReturning = !isRenewal && purchasedTiers.includes(config.tier);
+            const tierConfig = memoryQuotas[config.tier] || {};
 
             return { 
                 ...config, 
                 is_renewal: !!isRenewal,
-                is_returning: isReturning
+                is_returning: isReturning,
+                bg: tierConfig.bg,
+                color: tierConfig.color,
+                features: tierConfig.features
             };
         });
 

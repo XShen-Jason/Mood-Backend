@@ -15,16 +15,50 @@ const router = express.Router();
 
 const BASE_DOMAIN = process.env.CF_ZONE_NAME || 'moodspace.xyz';
 
-let memoryBlocklist = [];
+let memoryBlocklist = ['api', 'www', 'admin', 'rs', 'romance', 'space', 'help', 'docs', 'status'];
 let blocklistLoaded = false;
 let lastSeenKvBlocklist = null; // Track exact string state from KV
 let stagedBlocklist = null;
 
 const QUOTA_DEFAULTS = {
-    'free': { limit: 1, dailyLimit: 3, minDomainLen: 3, allowHideFooter: false, label: '🌟 体验用户' },
-    'pro': { limit: 5, dailyLimit: 10, minDomainLen: 3, allowHideFooter: false, label: '💎 高级会员' },
-    'partner': { limit: 15, dailyLimit: 100, minDomainLen: 1, allowHideFooter: true, label: '👑 终身合伙人' },
-    'admin': { limit: 999, dailyLimit: 999, minDomainLen: 1, allowHideFooter: true, label: '🛡️ 系统管理员' }
+    'free': { 
+        limit: 1, dailyLimit: 3, minDomainLen: 3, allowHideFooter: false, label: '🌟 体验用户',
+        bg: '#f0e6ee', color: 'var(--pink)',
+        features: [
+            { text: '精选免费模板库', active: true },
+            { text: '1 个专属域名配额', active: true },
+            { text: '每日 3 次修改限制', active: true },
+            { text: '标准 CDN 加载速度', active: true },
+            { text: '支持 480+ BGM 库', active: true },
+            { text: '移除底部版权标识', active: false },
+            { text: '高级粒子特效定制', active: false }
+        ]
+    },
+    'pro': { 
+        limit: 3, dailyLimit: 10, minDomainLen: 3, allowHideFooter: true, label: '💎 高级会员',
+        bg: 'linear-gradient(135deg, #f43f5e, #e11d48)', color: '#fff',
+        features: [
+            { text: '100% 模板库自由切换', active: true },
+            { text: '3 个专属域名配额', active: true },
+            { text: '全库 480+ 款无损 BGM 库', active: true },
+            { text: '动态粒子特效背景自由定制', active: true },
+            { text: '专属 7x24h 技术支持', active: false },
+            { text: '支持绑定个人顶级域名', active: false }
+        ]
+    },
+    'partner': { 
+        limit: 15, dailyLimit: 100, minDomainLen: 1, allowHideFooter: true, label: '👑 终身合伙人',
+        bg: 'linear-gradient(135deg, #7c3aed, #4f46e5)', color: '#fff',
+        features: [
+            { text: '100% 模板库自由切换', active: true },
+            { text: '15 个专属域名配额', active: true },
+            { text: '全库 480+ 款无损 BGM 库', active: true },
+            { text: '动态粒子特效背景自由定制', active: true },
+            { text: '专属 7x24h 技术支持', active: true },
+            { text: '支持绑定个人顶级域名', active: true }
+        ]
+    },
+    'admin': { limit: 999, dailyLimit: 999, minDomainLen: 1, allowHideFooter: true, label: '🛡️ 系统管理员', bg: '#1e293b', color: '#fbbf24', features: [] }
 };
 
 let memoryQuotas = { ...QUOTA_DEFAULTS };
@@ -96,9 +130,8 @@ async function validateAndCheckQuota(userId, subdomain, template) {
         return { isValid: false, code: 4002, message: `该域名前缀太短啦，您的等级至少需要 ${minLen} 个字符哦` };
     }
 
-    const HARDCODED_RESERVED = ['api', 'www', 'admin', 'rs', 'romance', 'space', 'help', 'docs', 'status'];
     await ensureBlocklist();
-    if (memoryBlocklist.includes(subLow) || HARDCODED_RESERVED.includes(subLow)) {
+    if (memoryBlocklist.includes(subLow)) {
         return { isValid: false, code: 4003, message: '该域名为系统保留字或已禁用，请更换试试哦' };
     }
 
@@ -641,6 +674,8 @@ router.get('/status/:userId', async (req, res) => {
         const minDomainLen = tierConfig?.minDomainLen ?? 3;
         const allowHideFooter = tierConfig?.allowHideFooter ?? false;
         const label = tierConfig?.label ?? '体验用户';
+        const bg = tierConfig?.bg ?? '#f0e6ee';
+        const color = tierConfig?.color ?? 'var(--pink)';
         
         const today = new Date().toISOString().split('T')[0];
         const dailyUsedEdits = profile?.last_edit_date === today ? (profile?.daily_edit_count || 0) : 0;
@@ -657,7 +692,9 @@ router.get('/status/:userId', async (req, res) => {
                 dailyUsedEdits,
                 maxDailyEdits,
                 minDomainLen,
-                allowHideFooter
+                allowHideFooter,
+                bg,
+                color
             }
         };
 
@@ -695,4 +732,4 @@ router.get('/config-by-subdomain/:subdomain', async (req, res) => {
     }
 });
 
-module.exports = { router, renderProjectInternal, memoryQuotas };
+module.exports = { router, renderProjectInternal, memoryQuotas, ensureQuotas };
