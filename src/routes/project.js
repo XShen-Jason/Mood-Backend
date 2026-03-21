@@ -762,12 +762,17 @@ router.get('/status/:userId', async (req, res) => {
         const today = new Date().toISOString().split('T')[0];
         const dailyUsedEdits = profile?.last_edit_date === today ? (profile?.daily_edit_count || 0) : 0;
 
+        const baseLimit = tierConfig?.limit ?? 1;
+        const inviteBonus = (inviteCount || 0) + (profile?.invited_by ? 1 : 0);
+
         const responseData = {
             success: true,
             data: {
                 tier,
                 label,
                 count,
+                baseLimit,
+                inviteBonus,
                 maxDomains,
                 isOverQuota: count > maxDomains,
                 activeProjectId: activeProjectSubdomain,
