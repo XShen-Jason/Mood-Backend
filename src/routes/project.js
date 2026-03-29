@@ -105,6 +105,67 @@ async function ensureBlocklist() {
     }
 }
 
+// ── NEW HELPER: Domain Lock Expiration Check ─────────────────────────────────
+async function isDomainActiveOrLocked(ownerId, domainName) {
+    if (!ownerId) return { isActive: true, timeLeft: null };
+
+    const { data: ownerProfile } = await supabase
+        .from('profiles')
+        .select('tier, role, subscription_expires_at')
+        .eq('id', ownerId)
+        .maybeSingle();
+        
+    if (!ownerProfile) return { isActive: true, timeLeft: null };
+
+    const ownerTier = ownerProfile?.tier || ownerProfile?.role || 'free';
+    await ensureQuotas();
+    const ownerTierConfig = memoryQuotas[ownerTier] || memoryQuotas['free'];
+
+    const { count: ownerInviteCount } = await supabase
+        .from('profiles')
+        .select('id', { count: 'exact', head: true })
+        .eq('invited_by', ownerId);
+
+    const ownerMaxDomains = (ownerTierConfig?.limit || 1) + (ownerInviteCount || 0);
+
+    const { data: ownerProjects } = await supabase
+        .from('projects')
+        .select('subdomain, updated_at')
+        .eq('user_id', ownerId)
+        .order('updated_at', { ascending: false });
+
+    const ownerCurrentProjectCount = ownerProjects?.length || 0;
+
+    if (ownerCurrentProjectCount > ownerMaxDomains) {
+        const projectIndex = ownerProjects.findIndex(p => p.subdomain === domainName);
+        if (projectIndex >= ownerMaxDomains) {
+            // It is in the locked overflow section.
+            const existingSame = ownerProjects[projectIndex];
+            let lockStartTime = new Date(existingSame.updated_at).getTime();
+            if (ownerProfile?.subscription_expires_at) {
+                const subExpTime = new Date(ownerProfile.subscription_expires_at).getTime();
+                if (!isNaN(subExpTime)) {
+                    lockStartTime = Math.max(lockStartTime, subExpTime);
+                }
+            }
+            
+            const releaseTime = lockStartTime + 3 * 24 * 60 * 60 * 1000;
+            const now = Date.now();
+            const timeLeft = releaseTime - now;
+
+            if (timeLeft <= 0) {
+                // Released!
+                return { isActive: false, timeLeft: null };
+            } else {
+                // Locked but still ticking
+                return { isActive: true, timeLeft };
+            }
+        }
+    }
+    
+    return { isActive: true, timeLeft: null };
+}
+
 // ── Helper: Supabase Validation & Quota Checking ─────────────────────────────
 async function validateAndCheckQuota(userId, subdomain, template) {
     if (!userId) {
@@ -145,7 +206,12 @@ async function validateAndCheckQuota(userId, subdomain, template) {
     if (existErr) throw new Error('Supabase Existing Check Error: ' + existErr.message);
 
     if (existingSameDomain && existingSameDomain.user_id !== userId) {
-        return { isValid: false, code: 4005, message: '该域名已被其他用户抢注啦，换一个更特别的吧~' };
+        const domainStatus = await isDomainActiveOrLocked(existingSameDomain.user_id, subLow);
+        if (domainStatus.isActive) {
+            return { isValid: false, code: 4005, message: '该域名已被其他用户抢注啦，换一个更特别的吧~' };
+        }
+        // If isActive === false, it means the 3-day grace period expired!
+        // Allow the current user to proceed and overwrite the domain.
     }
 
     // 4. Fetch all user projects to check quota and identify the latest one
@@ -466,15 +532,32 @@ router.get('/check-domain', async (req, res) => {
 
         if (existErr) throw new Error('Supabase Check Error: ' + existErr.message);
 
-        const isTaken = !!existingSameDomain;
-        
-        // 4. Update Cache
-        domainStatusCache.set(domain, { isTaken, timestamp: Date.now() });
-
-        if (isTaken) {
-            return res.json({ available: false, message: '已被其他用户抢注啦，换一个更特别的吧~' });
+        if (existingSameDomain) {
+            // Evaluate privacy-safe expiration
+            const domainStatus = await isDomainActiveOrLocked(existingSameDomain.user_id, domain);
+            
+            if (domainStatus.isActive) {
+                let msg = '已被其他用户抢注啦，换一个更特别的吧~';
+                
+                // If it's locked and in grace period, show limited countdown
+                if (domainStatus.timeLeft) {
+                    const days = Math.floor(domainStatus.timeLeft / (1000 * 60 * 60 * 24));
+                    const hours = Math.floor((domainStatus.timeLeft % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+                    if (days > 0 || hours > 0) {
+                        msg = `已被抢注，但该域名因原主人未续费被锁定，将于 ${days > 0 ? days + '天 ' : ''}${hours}小时 后释放`;
+                    } else {
+                        msg = `已被抢注，但该域名因原主人未续费被锁定，将于 1小时内 释放`; 
+                    }
+                }
+                
+                domainStatusCache.set(domain, { isTaken: true, timestamp: Date.now() });
+                return res.json({ available: false, message: msg });
+            }
+            // If NOT active (released via expiration), let logic fall through to "Available"
         }
         
+        // 4. Update Cache (Available / Released)
+        domainStatusCache.set(domain, { isTaken: false, timestamp: Date.now() });
         return res.json({ available: true, message: '🎉 可以使用！' });
 
     } catch (err) {

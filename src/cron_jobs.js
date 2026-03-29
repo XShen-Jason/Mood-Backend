@@ -1,4 +1,8 @@
 const { supabase } = require('./utils/supabase');
+const { kvDelete } = require('./utils/kv');
+const { r2Delete } = require('./utils/r2');
+const { purgeCacheUrls } = require('./utils/cache');
+const { memoryQuotas, ensureQuotas } = require('./routes/project');
 
 const WORKER_INTERVAL_MS = 2000; // Pulls a job every 2 seconds
 const GC_INTERVAL_MS = 5 * 60 * 1000; // Garabage collection & fallbacks every 5 mins
@@ -106,6 +110,78 @@ async function maintenanceSweeper() {
     }
 }
 
+/**
+ * Sweeps the DB for projects that have been locked and expired for over 3 days.
+ * Scans user quotas and actively deletes overflowing projects to save R2/KV space.
+ */
+async function sweepExpiredProjects() {
+    try {
+        await ensureQuotas();
+        const BASE_DOMAIN = process.env.CF_ZONE_NAME || 'moodspace.xyz';
+
+        // 1. Fetch all projects
+        const { data: projects, error } = await supabase
+            .from('projects')
+            .select('subdomain, user_id, updated_at')
+            .order('updated_at', { ascending: false });
+
+        if (error || !projects) return;
+
+        // Group by user
+        const userProjectsMap = {};
+        for (const p of projects) {
+            if (!userProjectsMap[p.user_id]) userProjectsMap[p.user_id] = [];
+            userProjectsMap[p.user_id].push(p);
+        }
+
+        // Evaluate each user's quotas
+        for (const [userId, userProjs] of Object.entries(userProjectsMap)) {
+            const { data: profile } = await supabase
+                .from('profiles')
+                .select('tier, role, subscription_expires_at')
+                .eq('id', userId)
+                .maybeSingle();
+
+            const tier = profile?.tier || profile?.role || 'free';
+            const tierConfig = memoryQuotas[tier] || memoryQuotas['free'];
+
+            const { count: inviteCount } = await supabase
+                .from('profiles')
+                .select('id', { count: 'exact', head: true })
+                .eq('invited_by', userId);
+
+            const maxDomains = (tierConfig?.limit || 1) + (inviteCount || 0);
+
+            if (userProjs.length > maxDomains) {
+                // Determine locked projects
+                for (let i = maxDomains; i < userProjs.length; i++) {
+                    const p = userProjs[i];
+                    let lockStartTime = new Date(p.updated_at).getTime();
+                    
+                    if (profile?.subscription_expires_at) {
+                        const subExpTime = new Date(profile.subscription_expires_at).getTime();
+                        if (!isNaN(subExpTime)) {
+                            lockStartTime = Math.max(lockStartTime, subExpTime);
+                        }
+                    }
+
+                    const releaseTime = lockStartTime + 3 * 24 * 60 * 60 * 1000;
+                    if (Date.now() >= releaseTime) {
+                        console.log(`[sweepExpiredProjects] Deleting expired project: ${p.subdomain}`);
+                        // Delete logic
+                        await kvDelete(p.subdomain).catch(() => {});
+                        await r2Delete(`pages/${p.subdomain}/index.html`).catch(() => {});
+                        await purgeCacheUrls([`https://${p.subdomain}.${BASE_DOMAIN}/`, `https://${p.subdomain}.${BASE_DOMAIN}`]).catch(() => {});
+                        await supabase.from('projects').delete().eq('subdomain', p.subdomain);
+                    }
+                }
+            }
+        }
+    } catch (err) {
+        console.error('[sweepExpiredProjects] Failed', err);
+    }
+}
+
 // Initialization Hooks
 function startPaymentEngine() {
     console.log('[engine] Starting L6.5 Payment Job Worker...');
@@ -113,6 +189,9 @@ function startPaymentEngine() {
     
     console.log('[engine] Starting Background Maintenance Sweeper...');
     setInterval(maintenanceSweeper, GC_INTERVAL_MS);
+
+    console.log('[engine] Starting Background Expired Project Sweeper...');
+    setInterval(sweepExpiredProjects, 24 * 60 * 60 * 1000); // Check every 1 day
 }
 
 module.exports = { startPaymentEngine };
