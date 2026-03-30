@@ -42,14 +42,24 @@ router.get('/pricing', async (req, res) => {
         // Ensure we have latest quotas loaded from KV
         await ensureQuotas();
 
-        // purchased_tiers is now a server-side field — zero extra queries needed
         const purchasedTiers = Array.isArray(profile?.purchased_tiers) ? profile.purchased_tiers : [];
+        const purchasedConfigIds = Array.isArray(profile?.purchased_config_ids) ? profile.purchased_config_ids : [];
 
         const enriched = data.map(config => {
             const isRenewal = profile &&
                              profile.tier === config.tier &&
                              profile.subscription_expires_at &&
                              new Date(profile.subscription_expires_at) > new Date();
+
+            const hasBoughtThisId = purchasedConfigIds.includes(config.id);
+            const isDiscount = config.first_month_price != null && config.first_month_price < config.base_price;
+
+            // L6.5 Professional Visibility Logic:
+            // 1. If it's a discount package and user HAS bought it before AND is NOT currently active -> HIDE
+            // (Allows the specific "Continuous Monthly" offer to disappear after expiry)
+            if (isDiscount && hasBoughtThisId && !isRenewal) {
+                return null;
+            }
 
             const isReturning = !isRenewal && purchasedTiers.includes(config.tier);
             const tierConfig = memoryQuotas[config.tier] || {};
@@ -60,11 +70,11 @@ router.get('/pricing', async (req, res) => {
                 is_returning: isReturning,
                 bg: tierConfig.bg,
                 color: tierConfig.color,
-                accentColor: tierConfig.accentColor, // Add for specific UI elements
+                accentColor: tierConfig.accentColor, 
                 features: tierConfig.features,
-                limit: tierConfig.limit // Add for frontend sorting/display
+                limit: tierConfig.limit 
             };
-        });
+        }).filter(Boolean);
 
         return res.json({ success: true, data: enriched });
     } catch (err) {
