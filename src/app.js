@@ -42,7 +42,7 @@ const apiLimiter = rateLimit({
 app.use(
     cors({
         origin: process.env.ALLOWED_ORIGIN ?? '*',
-        methods: ['GET', 'POST', 'OPTIONS'],
+        methods: ['GET', 'POST', 'DELETE', 'PATCH', 'OPTIONS'],
         allowedHeaders: ['Content-Type', 'X-Admin-Key'],
     })
 );
